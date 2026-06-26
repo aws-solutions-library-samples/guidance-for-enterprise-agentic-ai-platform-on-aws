@@ -1,0 +1,166 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agentic AI Platform - Management Account Configuration.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  SecurityAccountId:
+    Type: String
+    Description: Account ID of the security account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+Resources:
+
+  # =========================================================================
+  # Cross-Account Admin Role
+  # =========================================================================
+
+  OrganizationAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-org-admin'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrgReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:Describe*
+                  - organizations:List*
+                Resource: '*'
+
+  # =========================================================================
+  # Organization CloudTrail (logs all accounts to security account bucket)
+  # =========================================================================
+
+  OrgTrailAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED: "This is the access logging destination bucket"
+    Properties:
+      BucketName: !Sub '${ProjectName}-org-trail-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      VersioningConfiguration:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  OrgTrailAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OrgTrailAccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt OrgTrailAccessLogsBucket.Arn
+              - !Sub '${OrgTrailAccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  OrgTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-org-trail-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref OrgTrailAccessLogsBucket
+        LogFilePrefix: org-trail/
+      VersioningConfiguration:
+        Status: Enabled
+
+  OrgTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OrgTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt OrgTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${OrgTrailBucket.Arn}/AWSLogs/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt OrgTrailBucket.Arn
+              - !Sub '${OrgTrailBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  OrgAuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: OrgTrailBucketPolicy
+    Properties:
+      TrailName: !Sub '${ProjectName}-org-trail'
+      IsLogging: true
+      S3BucketName: !Ref OrgTrailBucket
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+      IsOrganizationTrail: true
+
+Outputs:
+  OrganizationAdminRoleArn:
+    Value: !GetAtt OrganizationAdminRole.Arn
+    Description: ARN of the organization admin role
+  OrgTrailArn:
+    Value: !GetAtt OrgAuditTrail.Arn
+    Description: Organization CloudTrail ARN

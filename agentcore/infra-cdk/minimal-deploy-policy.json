@@ -1,0 +1,88 @@
+{
+  "_comment": "Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved. SPDX-License-Identifier: MIT-0. Replace ACCOUNT_ID and REGION with your values before use.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationAccess",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:UpdateStack",
+        "cloudformation:DeleteStack",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DescribeStackEvents",
+        "cloudformation:GetTemplate",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:GetTemplateSummary"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:REGION:ACCOUNT_ID:stack/*"
+      ]
+    },
+    {
+      "Sid": "S3Access",
+      "Effect": "Allow",
+      "Action": [
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:GetObjectAcl",
+        "s3:PutObjectAcl"
+      ],
+      "Resource": [
+        "arn:aws:s3:::cdk-*",
+        "arn:aws:s3:::cdk-*/*"
+      ]
+    },
+    {
+      "Sid": "SSMParameters",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:PutParameter"
+      ],
+      "Resource": [
+        "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/cdk-*"
+      ]
+    },
+    {
+      "Sid": "ECRAccess",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:DescribeRepositories",
+        "ecr:DescribeImages",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:PutImage",
+        "ecr:BatchCheckLayerAvailability"
+      ],
+      "Resource": [
+        "arn:aws:ecr:REGION:ACCOUNT_ID:repository/cdk-*"
+      ]
+    },
+    {
+      "Sid": "ECRAuth",
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken"
+      ],
+      "Resource": "*",
+      "_comment": "ecr:GetAuthorizationToken does not support resource-level permissions"
+    },
+    {
+      "Sid": "IAMPassRole",
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::ACCOUNT_ID:role/cdk-*"
+      ]
+    }
+  ]
+}

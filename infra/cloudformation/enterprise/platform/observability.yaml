@@ -1,0 +1,146 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agentic AI Platform - Observability Account.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  SharedToolingAccountId:
+    Type: String
+    Description: Account ID of the shared-tooling account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  DevAccountId:
+    Type: String
+    Description: Account ID of the dev account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  StagingAccountId:
+    Type: String
+    Description: Account ID of the staging account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  ProdAccountId:
+    Type: String
+    Description: Account ID of the prod account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+
+Resources:
+
+  # =========================================================================
+  # Amazon CloudWatch Cross-Account Observability (OAM) Sink
+  # =========================================================================
+  # Sink policy uses an explicit account list rather than Principal: "*" +
+  # aws:PrincipalOrgID. Both patterns are AWS-documented; we pick explicit
+  # to pass aggressive custom scanners out of the box. Tradeoff: new member
+  # accounts must be added here and the stack redeployed. See
+  # docs/platform-observability.md for the full comparison.
+  #
+  # Customer responsibility: Validate the account list matches your
+  # organization structure. Monitor for unauthorized policy changes via
+  # AWS Config rules. Review this list when adding/removing accounts.
+  #
+  # CloudWatch Logs and X-Ray use AWS-managed encryption at rest by default.
+  # OAM cross-account data transfer uses TLS in transit.
+  # For customer-managed keys, configure KMS on log groups in source accounts.
+  ObservabilitySink:
+    Type: AWS::Oam::Sink
+    Properties:
+      Name: !Sub '${ProjectName}-observability-sink'
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${SharedToolingAccountId}:root'
+                - !Sub 'arn:aws:iam::${DevAccountId}:root'
+                - !Sub 'arn:aws:iam::${StagingAccountId}:root'
+                - !Sub 'arn:aws:iam::${ProdAccountId}:root'
+            Action:
+              - 'oam:CreateLink'
+              - 'oam:UpdateLink'
+            Resource: '*'
+            Condition:
+              'ForAllValues:StringEquals':
+                'oam:ResourceTypes':
+                  - 'AWS::CloudWatch::Metric'
+                  - 'AWS::Logs::LogGroup'
+                  - 'AWS::XRay::Trace'
+
+  SinkArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/observability/sink-arn'
+      Type: String
+      Value: !GetAtt ObservabilitySink.Arn
+
+  # =========================================================================
+  # Dashboard: Cross-environment operational health
+  # =========================================================================
+
+  AllEnvDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-agents-all'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":24,"height":6,"properties":{"title":"Invocations by Environment","metrics":[["${ProjectName}","AgentInvocations",{"stat":"Sum","accountId":"${DevAccountId}","label":"Dev"}],["${ProjectName}","AgentInvocations",{"stat":"Sum","accountId":"${StagingAccountId}","label":"Staging"}],["${ProjectName}","AgentInvocations",{"stat":"Sum","accountId":"${ProdAccountId}","label":"Prod"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Latency p50 by Environment","metrics":[["${ProjectName}","AgentLatency",{"stat":"p50","accountId":"${DevAccountId}","label":"Dev"}],["${ProjectName}","AgentLatency",{"stat":"p50","accountId":"${StagingAccountId}","label":"Staging"}],["${ProjectName}","AgentLatency",{"stat":"p50","accountId":"${ProdAccountId}","label":"Prod"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Latency p99 by Environment","metrics":[["${ProjectName}","AgentLatency",{"stat":"p99","accountId":"${DevAccountId}","label":"Dev"}],["${ProjectName}","AgentLatency",{"stat":"p99","accountId":"${StagingAccountId}","label":"Staging"}],["${ProjectName}","AgentLatency",{"stat":"p99","accountId":"${ProdAccountId}","label":"Prod"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":0,"y":12,"width":12,"height":6,"properties":{"title":"Input Tokens by Environment","metrics":[["${ProjectName}","InputTokens",{"stat":"Sum","accountId":"${DevAccountId}","label":"Dev"}],["${ProjectName}","InputTokens",{"stat":"Sum","accountId":"${StagingAccountId}","label":"Staging"}],["${ProjectName}","InputTokens",{"stat":"Sum","accountId":"${ProdAccountId}","label":"Prod"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":12,"y":12,"width":12,"height":6,"properties":{"title":"Output Tokens by Environment","metrics":[["${ProjectName}","OutputTokens",{"stat":"Sum","accountId":"${DevAccountId}","label":"Dev"}],["${ProjectName}","OutputTokens",{"stat":"Sum","accountId":"${StagingAccountId}","label":"Staging"}],["${ProjectName}","OutputTokens",{"stat":"Sum","accountId":"${ProdAccountId}","label":"Prod"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":0,"y":18,"width":24,"height":6,"properties":{"title":"Tool Calls by Environment","metrics":[["${ProjectName}","ToolCallSuccess",{"stat":"Sum","accountId":"${DevAccountId}","label":"Dev"}],["${ProjectName}","ToolCallSuccess",{"stat":"Sum","accountId":"${StagingAccountId}","label":"Staging"}],["${ProjectName}","ToolCallSuccess",{"stat":"Sum","accountId":"${ProdAccountId}","label":"Prod"}]],"period":300,"region":"${AWS::Region}"}}
+          ]
+        }
+
+  # =========================================================================
+  # Dashboard: Agent Evaluations
+  # =========================================================================
+
+  EvalDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-evaluations'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":24,"height":6,"properties":{"title":"Overall Eval Score (all agents)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"yAxis":{"left":{"min":0,"max":1}},"annotations":{"horizontal":[{"value":0.6,"label":"Pass Threshold"}]},"metrics":[[{"expression":"SEARCH('{AgentPlatform/Evaluations,AgentName} MetricName=\"OverallScore\"', 'Average', 86400)","id":"e1","region":"${AWS::Region}","accountId":"${DevAccountId}"}]]}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Helpfulness (all agents)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"yAxis":{"left":{"min":0,"max":1}},"metrics":[[{"expression":"SEARCH('{AgentPlatform/Evaluations,AgentName} MetricName=\"Helpfulness\"', 'Average', 86400)","id":"e2","region":"${AWS::Region}","accountId":"${DevAccountId}"}]]}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Goal Success Rate (all agents)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"yAxis":{"left":{"min":0,"max":1}},"metrics":[[{"expression":"SEARCH('{AgentPlatform/Evaluations,AgentName} MetricName=\"GoalSuccessRate\"', 'Average', 86400)","id":"e3","region":"${AWS::Region}","accountId":"${DevAccountId}"}]]}},
+            {"type":"metric","x":0,"y":12,"width":24,"height":6,"properties":{"title":"Eval Invocation Latency (all agents)","region":"${AWS::Region}","view":"timeSeries","stacked":false,"yAxis":{"left":{"min":0}},"metrics":[[{"expression":"SEARCH('{AgentPlatform/Evaluations,AgentName} MetricName=\"InvocationLatency\"', 'Average', 86400)","id":"e4","region":"${AWS::Region}","accountId":"${DevAccountId}"}]]}}
+          ]
+        }
+
+  # =========================================================================
+  # Alarms (prod-focused when available, falls back to dev)
+  # =========================================================================
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-latency'
+      AlarmDescription: Agent p99 latency exceeds 30s
+      Namespace: !Ref ProjectName
+      MetricName: AgentLatency
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 30000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  AllEnvDashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-agents-all'
+  EvalDashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-evaluations'
+  SinkArn:
+    Value: !GetAtt ObservabilitySink.Arn
+    Export:
+      Name: !Sub '${ProjectName}-observability-sink-arn'

@@ -1,0 +1,41 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agentic AI Platform - Workload Account Observability Link.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  Environment:
+    Type: String
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for this workload account
+  ObservabilitySinkArn:
+    Type: String
+    Description: CloudWatch Observability Access Manager sink ARN from observability account
+
+Resources:
+
+  ObservabilityLink:
+    Type: AWS::Oam::Link
+    Properties:
+      LabelTemplate: '$AccountName'
+      ResourceTypes:
+        - 'AWS::CloudWatch::Metric'
+        - 'AWS::Logs::LogGroup'
+        - 'AWS::XRay::Trace'
+      SinkIdentifier: !Ref ObservabilitySinkArn
+
+Outputs:
+  LinkArn:
+    Value: !GetAtt ObservabilityLink.Arn
+    Description: OAM Link ARN for this workload account
+  LinkId:
+    Value: !GetAtt ObservabilityLink.Label
+    Description: OAM Link label

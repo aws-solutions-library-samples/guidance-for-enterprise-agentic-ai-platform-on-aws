@@ -1,0 +1,11 @@
+[
+  {
+    "name": "Simple word count",
+    "prompt": "How many words are in this text: 'The quick brown fox jumps over the lazy dog'",
+    "assertions": [
+      "Agent used a tool to count words",
+      "Agent returned the correct word count of 9"
+    ],
+    "trajectory": ["gateway_sample-tool-target___text_analysis_tool"]
+  }
+]

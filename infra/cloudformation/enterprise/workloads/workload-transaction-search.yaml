@@ -1,0 +1,166 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agentic AI Platform - CloudWatch Transaction Search Setup.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name for this workload account
+  SamplingPercentage:
+    Type: Number
+    Default: 100.0
+    MinValue: 0.0
+    MaxValue: 100.0
+    Description: >-
+      Percentage of spans to index (0-100). 100% is the right default for
+      low-to-moderate volume: every trace is queryable, cost stays negligible.
+
+Resources:
+
+  TransactionSearchSetupRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "xray:Update*, logs:Put*, logs:CreateLogGroup, application-signals:StartDiscovery, and cloudtrail:CreateServiceLinkedChannel are account-level APIs that require Resource '*'"
+    # checkov:skip=CKV_AWS_109: "iam:CreateServiceLinkedRole scoped to aws-service-role/* path; broader scoping not possible as AWS services are the actual callers"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "xray, application-signals, logs, and cloudtrail actions used here are account-level APIs that do not support resource-level permissions"
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-txn-search-setup'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TransactionSearchSetup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:GetTraceSegmentDestination
+                  - xray:UpdateTraceSegmentDestination
+                  - xray:GetIndexingRules
+                  - xray:UpdateIndexingRule
+                  - application-signals:StartDiscovery
+                  - logs:PutRetentionPolicy
+                  - logs:CreateLogGroup
+                  - logs:PutResourcePolicy
+                  - cloudtrail:CreateServiceLinkedChannel
+                Resource: '*'
+              # When UpdateTraceSegmentDestination runs on a fresh account,
+              # the Application Signals / X-Ray services themselves need to
+              # provision their service-linked roles on the Lambda's behalf.
+              # Scoped to aws-service-role/* path. Conditions on iam:AWSServiceName
+              # are not effective here because AWS services are the actual callers.
+              #
+              # Monitoring and mitigation:
+              #   1. Audit existing SLRs: aws iam list-roles --query "Roles[?Path==\`/aws-service-role/\`]"
+              #   2. Set up a CloudTrail alarm on CreateServiceLinkedRole events
+              #      filtered to this Lambda's role ARN to detect unexpected SLR creation.
+              #   3. Alternative: pre-create the required SLRs (AWSServiceRoleForApplicationSignals,
+              #      AWSServiceRoleForXRay) via CloudFormation and remove this permission entirely.
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - xray.amazonaws.com
+                      - application-signals.amazonaws.com
+                      - cloudtrail.amazonaws.com
+
+  TransactionSearchSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TransactionSearchFunction.Arn
+      SamplingPercentage: !Ref SamplingPercentage
+
+  TransactionSearchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-txn-search-setup'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt TransactionSearchSetupRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  sampling_pct = float(event['ResourceProperties'].get('SamplingPercentage', 1.0))
+
+                  if request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  xray = boto3.client('xray')
+                  logs = boto3.client('logs')
+
+                  try:
+                      logs.put_resource_policy(
+                          policyName='XRayTransactionSearch',
+                          policyDocument=json.dumps({
+                              'Version': '2012-10-17',
+                              'Statement': [{
+                                  'Sid': 'AllowXRayToWriteLogs',
+                                  'Effect': 'Allow',
+                                  'Principal': {'Service': 'xray.amazonaws.com'},
+                                  'Action': ['logs:PutLogEvents', 'logs:CreateLogGroup', 'logs:CreateLogStream'],
+                                  'Resource': '*'
+                              }]
+                          })
+                      )
+                  except Exception as e:
+                      print(f'Resource policy warning: {e}')
+
+                  try:
+                      xray.update_trace_segment_destination(Destination='CloudWatchLogs')
+                  except xray.exceptions.InvalidRequestException:
+                      pass  # Already set
+
+                  xray.update_indexing_rule(
+                      Name='Default',
+                      Rule={'Probabilistic': {'DesiredSamplingPercentage': sampling_pct}}
+                  )
+
+                  dest = xray.get_trace_segment_destination()
+                  status = dest.get('Destination', 'Unknown')
+                  print(f'Transaction Search configured: destination={status}, sampling={sampling_pct}%')
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Status': 'CONFIGURED',
+                      'SamplingPercentage': str(sampling_pct)
+                  })
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+Outputs:
+  TransactionSearchStatus:
+    Value: 'ENABLED'
+    Description: Transaction Search is enabled in this account
+  SamplingPercentage:
+    Value: !Ref SamplingPercentage
+    Description: Configured span indexing percentage

@@ -1,0 +1,522 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Agentic AI Platform - Security Account.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  StackName:
+    Type: String
+    Default: fastagent-enterprise
+    Description: >-
+      Logical stack name used as a prefix for Cognito and machine client
+      names (also used by CDK as stack_name_base).
+  ManagementAccountId:
+    Type: String
+    Description: Account ID of the management account
+    AllowedPattern: "^\\d{12}$"
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  ObservabilityAccountId:
+    Type: String
+    Description: Account ID of the observability account
+    AllowedPattern: "^\\d{12}$"
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  SharedToolingAccountId:
+    Type: String
+    Description: Account ID of the shared-tooling account
+    AllowedPattern: "^\\d{12}$"
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  DevAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^\\d{12}$|^$"
+    Description: Account ID of the dev workload account. Empty to skip dev machine client.
+  StagingAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^\\d{12}$|^$"
+    Description: Account ID of the staging workload account. Empty to skip staging machine client.
+  ProdAccountId:
+    Type: String
+    Default: ""
+    AllowedPattern: "^\\d{12}$|^$"
+    Description: Account ID of the prod workload account. Empty to skip prod machine client.
+
+Conditions:
+  HasDev: !Not [!Equals [!Ref DevAccountId, ""]]
+  HasStaging: !Not [!Equals [!Ref StagingAccountId, ""]]
+  HasProd: !Not [!Equals [!Ref ProdAccountId, ""]]
+
+Resources:
+
+  # =========================================================================
+  # Centralized Security Findings Bucket
+  # =========================================================================
+
+  SecurityAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Properties:
+      BucketName: !Sub "${ProjectName}-security-access-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  SecurityAccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecurityAccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SecurityAccessLogsBucket.Arn
+              - !Sub "${SecurityAccessLogsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  SecurityFindingsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-security-findings-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SecurityKmsKey
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref SecurityAccessLogsBucket
+        LogFilePrefix: security-findings/
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 365
+
+  SecurityFindingsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecurityFindingsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt SecurityFindingsBucket.Arn
+              - !Sub "${SecurityFindingsBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowCrossAccountPut
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${ObservabilityAccountId}:root"
+                - !Sub "arn:aws:iam::${SharedToolingAccountId}:root"
+                - !If [HasDev, !Sub "arn:aws:iam::${DevAccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasStaging, !Sub "arn:aws:iam::${StagingAccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasProd, !Sub "arn:aws:iam::${ProdAccountId}:root", !Ref "AWS::NoValue"]
+            Action:
+              - s3:PutObject
+            Resource: !Sub "${SecurityFindingsBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+                s3:x-amz-server-side-encryption-aws-kms-key-id: !GetAtt SecurityKmsKey.Arn
+
+  # =========================================================================
+  # KMS Key for Security Data
+  # =========================================================================
+
+  SecurityKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Encryption key for Agentic AI Platform security data
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: RootAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: "*"
+          - Sid: CrossAccountEncrypt
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${ObservabilityAccountId}:root"
+                - !Sub "arn:aws:iam::${SharedToolingAccountId}:root"
+                - !If [HasDev, !Sub "arn:aws:iam::${DevAccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasStaging, !Sub "arn:aws:iam::${StagingAccountId}:root", !Ref "AWS::NoValue"]
+                - !If [HasProd, !Sub "arn:aws:iam::${ProdAccountId}:root", !Ref "AWS::NoValue"]
+            Action:
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: CrossAccountDecrypt
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub "arn:aws:iam::${ManagementAccountId}:root"
+                - !Sub "arn:aws:iam::${ObservabilityAccountId}:root"
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: "*"
+
+  SecurityKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-security"
+      TargetKeyId: !Ref SecurityKmsKey
+
+  # =========================================================================
+  # CloudTrail
+  # =========================================================================
+
+  AuditTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/${ProjectName}/audit-trail"
+      RetentionInDays: 365
+
+  AuditTrailLogGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-audit-trail-cw-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${AuditTrailLogGroup.Arn}:*"
+
+  AuditTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-audit-trail-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref SecurityKmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref SecurityAccessLogsBucket
+        LogFilePrefix: audit-trail/
+      VersioningConfiguration:
+        Status: Enabled
+
+  AuditTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AuditTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AWSCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AuditTrailBucket.Arn
+          - Sid: AWSCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${AuditTrailBucket.Arn}/AWSLogs/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource:
+              - !GetAtt AuditTrailBucket.Arn
+              - !Sub "${AuditTrailBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  AuditTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: AuditTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-audit-trail"
+      IsLogging: true
+      S3BucketName: !Ref AuditTrailBucket
+      CloudWatchLogsLogGroupArn: !GetAtt AuditTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt AuditTrailLogGroupRole.Arn
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: true
+
+  # =========================================================================
+  # Identity — Cognito User Pool + Hosted UI + Gateway resource server
+  # =========================================================================
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${StackName}-users"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${StackName}-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      PreventUserExistenceErrors: ENABLED
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${StackName}-${AWS::AccountId}-${AWS::Region}"
+      UserPoolId: !Ref UserPool
+
+  GatewayResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub "${StackName}-gateway"
+      Name: !Sub "${StackName}-gateway-resource-server"
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read access to gateway
+        - ScopeName: write
+          ScopeDescription: Write access to gateway
+
+  # =========================================================================
+  # Per-env machine clients. Secret stays in Cognito; workload accounts
+  # assume MachineClientDescribeRole to fetch it on demand at deploy time.
+  # =========================================================================
+
+  MachineClientDescribeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${StackName}-machine-client-describe"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - !If
+            - HasDev
+            - Effect: Allow
+              Principal: { AWS: !Sub "arn:aws:iam::${DevAccountId}:root" }
+              Action: sts:AssumeRole
+            - !Ref "AWS::NoValue"
+          - !If
+            - HasStaging
+            - Effect: Allow
+              Principal: { AWS: !Sub "arn:aws:iam::${StagingAccountId}:root" }
+              Action: sts:AssumeRole
+            - !Ref "AWS::NoValue"
+          - !If
+            - HasProd
+            - Effect: Allow
+              Principal: { AWS: !Sub "arn:aws:iam::${ProdAccountId}:root" }
+              Action: sts:AssumeRole
+            - !Ref "AWS::NoValue"
+      Policies:
+        - PolicyName: DescribeMachineClients
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt UserPool.Arn
+
+  MachineClientDescribeRoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/${StackName}/machine_clients/describe_role_arn"
+      Type: String
+      Value: !GetAtt MachineClientDescribeRole.Arn
+      Description: ARN of cross-account role workload accounts assume to describe the Cognito machine client
+
+  # --- dev ---
+  DevMachineClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: HasDev
+    DependsOn: GatewayResourceServer
+    Properties:
+      ClientName: !Sub "${StackName}-dev-machine-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub "${StackName}-gateway/read"
+        - !Sub "${StackName}-gateway/write"
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      SupportedIdentityProviders: [COGNITO]
+
+  DevMachineClientIdParam:
+    Type: AWS::SSM::Parameter
+    Condition: HasDev
+    Properties:
+      Name: !Sub "/${StackName}/machine_clients/dev/client_id"
+      Type: String
+      Value: !Ref DevMachineClient
+      Description: Cognito machine client id for dev workload account
+
+  # --- staging ---
+  StagingMachineClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: HasStaging
+    DependsOn: GatewayResourceServer
+    Properties:
+      ClientName: !Sub "${StackName}-staging-machine-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub "${StackName}-gateway/read"
+        - !Sub "${StackName}-gateway/write"
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      SupportedIdentityProviders: [COGNITO]
+
+  StagingMachineClientIdParam:
+    Type: AWS::SSM::Parameter
+    Condition: HasStaging
+    Properties:
+      Name: !Sub "/${StackName}/machine_clients/staging/client_id"
+      Type: String
+      Value: !Ref StagingMachineClient
+
+  # --- prod ---
+  ProdMachineClient:
+    Type: AWS::Cognito::UserPoolClient
+    Condition: HasProd
+    DependsOn: GatewayResourceServer
+    Properties:
+      ClientName: !Sub "${StackName}-prod-machine-client"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub "${StackName}-gateway/read"
+        - !Sub "${StackName}-gateway/write"
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      SupportedIdentityProviders: [COGNITO]
+
+  ProdMachineClientIdParam:
+    Type: AWS::SSM::Parameter
+    Condition: HasProd
+    Properties:
+      Name: !Sub "/${StackName}/machine_clients/prod/client_id"
+      Type: String
+      Value: !Ref ProdMachineClient
+
+Outputs:
+  SecurityFindingsBucketArn:
+    Value: !GetAtt SecurityFindingsBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-security-findings-bucket-arn"
+  SecurityKmsKeyArn:
+    Value: !GetAtt SecurityKmsKey.Arn
+    Export:
+      Name: !Sub "${ProjectName}-security-kms-key-arn"
+  UserPoolId:
+    Value: !Ref UserPool
+    Export: { Name: !Sub "${StackName}-UserPoolId" }
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export: { Name: !Sub "${StackName}-UserPoolClientId" }
+  UserPoolDomain:
+    Value: !Sub "${StackName}-${AWS::AccountId}-${AWS::Region}.auth.${AWS::Region}.amazoncognito.com"
+    Export: { Name: !Sub "${StackName}-UserPoolDomain" }
+  MachineClientDescribeRoleArn:
+    Value: !GetAtt MachineClientDescribeRole.Arn
+    Description: Cross-account role workload accounts assume to describe the Cognito machine client
+    Export: { Name: !Sub "${StackName}-MachineClientDescribeRoleArn" }
+  DevMachineClientId:
+    Condition: HasDev
+    Value: !Ref DevMachineClient
+  StagingMachineClientId:
+    Condition: HasStaging
+    Value: !Ref StagingMachineClient
+  ProdMachineClientId:
+    Condition: HasProd
+    Value: !Ref ProdMachineClient

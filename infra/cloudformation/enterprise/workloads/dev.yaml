@@ -1,0 +1,503 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agentic AI Platform - Dev Account.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  Environment:
+    Type: String
+    Default: dev
+  SharedToolingAccountId:
+    Type: String
+    Description: Account ID of the shared-tooling account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+Resources:
+
+  # =========================================================================
+  # Memory Layer - Session State
+  # =========================================================================
+
+  # DynamoDB control plane operations are logged via CloudTrail.
+  # For data plane auditing, enable DynamoDB Streams (StreamSpecification)
+  # in production to capture item-level changes for compliance.
+  SessionMemoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-${Environment}-session-memory'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: session_id
+          AttributeType: S
+        - AttributeName: agent_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: session_id
+          KeyType: HASH
+        - AttributeName: created_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: agent-index
+          KeySchema:
+            - AttributeName: agent_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+
+  # =========================================================================
+  # Memory Layer - Semantic Memory (Vector Store)
+  # =========================================================================
+
+  # OpenSearch Serverless access logging requires CloudTrail at the account level.
+  # For production, enable CloudTrail data events for OpenSearch Serverless API calls.
+  SemanticMemoryCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: SemanticMemoryEncryptionPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-sem'
+      Type: VECTORSEARCH
+      Description: Vector store for agent semantic memory
+
+  SemanticMemoryEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-enc'
+      Type: encryption
+      Policy: !Sub >
+        {"Rules":[{"ResourceType":"collection","Resource":["collection/${ProjectName}-${Environment}-sem"]}],"AWSOwnedKey":true}
+
+  SemanticMemoryNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-net'
+      Type: network
+      Policy: !Sub >
+        [{"Rules":[{"ResourceType":"collection","Resource":["collection/${ProjectName}-${Environment}-sem"]},{"ResourceType":"dashboard","Resource":["collection/${ProjectName}-${Environment}-sem"]}],"AllowFromPublic":true}]
+
+  # =========================================================================
+  # Cross-Account Role for Pipeline (shared-tooling → dev)
+  # =========================================================================
+  # The promotion pipeline in shared-tooling assumes this role to:
+  # - Read SSM params (runtime ARNs) for eval
+  # - Deploy CDK stacks (agent runtimes)
+  # - Invoke agent runtimes for evaluation
+
+  PipelineCrossAccountRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "bedrock-agentcore, logs, xray, cloudwatch, and cognito-idp actions are account-level APIs that require Resource '*'"
+    # checkov:skip=CKV_AWS_109: "iam:PassRole and iam:CreateRole scoped to project and CDK role name patterns"
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-cross-account'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${SharedToolingAccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/fastagent-*'
+              # Amazon Bedrock AgentCore IAM actions
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeRuntime
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:Evaluate
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:ListEvaluators
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+              # logs:StartQuery/GetQueryResults/StopQuery do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: '*'
+              # xray and application-signals actions do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - xray:GetTraceSegmentDestination
+                  - xray:UpdateTraceSegmentDestination
+                  - xray:GetIndexingRules
+                  - xray:UpdateIndexingRule
+                Resource: '*'
+              # cloudwatch:PutMetricData does not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStacks
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - iam:GetRole
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${ProjectName}/*'
+              # cognito-idp:InitiateAuth — cross-account, no pool ARN available in this template
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                Resource: '*'
+
+  # =========================================================================
+  # Agent Execution Role
+  # =========================================================================
+
+  AgentExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-agent-execution'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Amazon Bedrock IAM actions
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+        - PolicyName: MemoryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt SessionMemoryTable.Arn
+                  - !Sub '${SessionMemoryTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource:
+                  - !GetAtt SemanticMemoryCollection.Arn
+        - PolicyName: CrossAccountAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AssumeSharedToolingRole
+                Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${SharedToolingAccountId}:role/${ProjectName}-shared-tooling-access'
+                  - !Sub 'arn:aws:iam::${SharedToolingAccountId}:role/${ProjectName}-ai-gateway'
+        - PolicyName: ObservabilityMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  # =========================================================================
+  # Gateway Function (MCP Server Host)
+  # =========================================================================
+
+  GatewayFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-gateway'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AgentExecutionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          SESSION_TABLE: !Ref SessionMemoryTable
+          SHARED_TOOLING_ACCOUNT_ID: !Ref SharedToolingAccountId
+      Code:
+        ZipFile: |
+          def handler(event, context):
+              return {"statusCode": 200, "body": "Gateway ready"}
+
+  GatewayFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt GatewayFunction.Arn
+      AuthType: AWS_IAM
+
+  # =========================================================================
+  # CI/CD - Build & Eval
+  # =========================================================================
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-artifacts-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: artifacts/
+      VersioningConfiguration:
+        Status: Enabled
+
+  ArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt ArtifactBucket.Arn
+              - !Sub '${ArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "logs:CreateLogGroup/Stream/PutLogEvents are account-level APIs that require Resource '*'"
+    # checkov:skip=CKV_AWS_109: "iam:PassRole scoped to project and CDK role name patterns"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # logs:CreateLogGroup/Stream/PutLogEvents do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${ArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStacks
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*'
+              - Effect: Allow
+                Action:
+                  - lambda:CreateFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:ListFunctions
+                  - lambda:InvokeFunction
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  - lambda:UntagResource
+                  - lambda:PublishVersion
+                  - lambda:CreateAlias
+                  - lambda:UpdateAlias
+                  - lambda:DeleteAlias
+                Resource:
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucket
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - echo "Build project ready. Connect a source (CodePipeline, GitHub, etc.) to enable CI/CD."
+                - echo "See deploy.sh examples for pipeline integration."
+
+Outputs:
+  SessionMemoryTableName:
+    Value: !Ref SessionMemoryTable
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-session-table'
+  SemanticMemoryEndpoint:
+    Value: !GetAtt SemanticMemoryCollection.CollectionEndpoint
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-semantic-endpoint'
+  AgentExecutionRoleArn:
+    Value: !GetAtt AgentExecutionRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-agent-role-arn'
+  GatewayUrl:
+    Value: !GetAtt GatewayFunctionUrl.FunctionUrl
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-gateway-url'
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket

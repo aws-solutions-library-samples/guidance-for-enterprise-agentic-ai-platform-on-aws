@@ -1,0 +1,1102 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agentic AI Platform - Shared Tooling Account.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentic-ai-platform
+  StackName:
+    Type: String
+    Default: fastagent-enterprise
+  DevAccountId:
+    Type: String
+    Description: Account ID of the dev account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  StagingAccountId:
+    Type: String
+    Description: Account ID of the staging account
+    AllowedPattern: '^\d{12}$'
+  ProdAccountId:
+    Type: String
+    Description: Account ID of the prod account
+    AllowedPattern: '^\d{12}$'
+  ObservabilityAccountId:
+    Type: String
+    Description: Account ID of the observability account
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: Must be a 12-digit AWS account ID
+  CognitoUserPoolId:
+    Type: String
+    Description: Cognito User Pool ID from auth layer
+    Default: ''
+  CognitoClientId:
+    Type: String
+    Description: Cognito App Client ID
+    Default: ''
+  CognitoUserPoolDomain:
+    Type: String
+    Description: Cognito Hosted UI domain, e.g. <prefix>.auth.<region>.amazoncognito.com
+    Default: ''
+  DevMachineClientId:
+    Type: String
+    Description: Cognito machine client id for the dev workload account
+    Default: ''
+  StagingMachineClientId:
+    Type: String
+    Description: Cognito machine client id for the staging workload account
+    Default: ''
+  ProdMachineClientId:
+    Type: String
+    Description: Cognito machine client id for the prod workload account
+    Default: ''
+  MachineClientDescribeRoleArn:
+    Type: String
+    Description: Cross-account role ARN in Security account that workload
+                 Lambdas assume to call cognito-idp:DescribeUserPoolClient.
+    Default: ''
+
+Resources:
+
+  # =========================================================================
+  # Cross-Account Access Role (for dev account)
+  # =========================================================================
+
+  SharedToolingCrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-shared-tooling-access'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${DevAccountId}:root'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SharedToolingReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+
+  # =========================================================================
+  # Shared ECR Repository for Agent Images
+  # =========================================================================
+
+  AgentImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/agents'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+      RepositoryPolicyText:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowWorkloadAccountPull
+            Effect: Allow
+            Principal:
+              AWS:
+                - !Sub 'arn:aws:iam::${DevAccountId}:root'
+                - !Sub 'arn:aws:iam::${StagingAccountId}:root'
+                - !Sub 'arn:aws:iam::${ProdAccountId}:root'
+            Action:
+              - ecr:BatchGetImage
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchCheckLayerAvailability
+
+  # =========================================================================
+  # CodeCommit Repository
+  # =========================================================================
+
+  AgentSourceRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-agents'
+      RepositoryDescription: !Sub 'Agent source code for ${ProjectName}'
+
+  # Branch protection: deny direct pushes to main
+  BranchProtectionPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-branch-protection'
+      Description: Deny direct pushes to main branch — changes must go through PR merge
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyDirectPushToProtectedBranches
+            Effect: Deny
+            Action:
+              - codecommit:GitPush
+              - codecommit:DeleteBranch
+            Resource: !GetAtt AgentSourceRepo.Arn
+            Condition:
+              StringEqualsIfExists:
+                codecommit:References:
+                  - refs/heads/main
+              'Null':
+                codecommit:References: 'false'
+
+  # =========================================================================
+  # Promotion Pipeline - Artifact Storage
+  # =========================================================================
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-pipeline-artifacts-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: pipeline-artifacts/
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  PipelineArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PipelineArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt PipelineArtifactBucket.Arn
+              - !Sub '${PipelineArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # =========================================================================
+  # Promotion Pipeline - Build & Package Agent
+  # =========================================================================
+
+  PipelineBuildRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "logs:CreateLogGroup/Stream/PutLogEvents and ecr:GetAuthorizationToken are account-level APIs that require Resource '*'"
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-build'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # logs:CreateLogGroup/Stream/PutLogEvents do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              # ecr:GetAuthorizationToken does not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                Resource: !GetAtt AgentImageRepository.Arn
+
+  PipelineBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-build-agent'
+      ServiceRole: !GetAtt PipelineBuildRole.Arn
+      TimeoutInMinutes: 15
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/agents'
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip install pyyaml
+            pre_build:
+              commands:
+                - echo "Logging in to ECR..."
+                - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+                - COMMIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-8)
+                - echo "Detecting changed agents..."
+                - |
+                  python3 -c "
+                  import yaml, json, subprocess, os, glob, re
+
+                  # Discover all agents from agents/*/agent.yaml
+                  all_agents = []
+                  for agent_yaml in sorted(glob.glob('agents/*/agent.yaml')):
+                      name = agent_yaml.split('/')[1]
+                      if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+                          print(f'WARN: Skipping invalid agent name: {name}')
+                          continue
+                      all_agents.append(name)
+
+                  if not all_agents:
+                      print('No agents found in agents/*/agent.yaml')
+                      json.dump([], open('changed_agents.json', 'w'))
+                      raise SystemExit(0)
+
+                  # Get changed files (compare to previous commit)
+                  try:
+                      diff = subprocess.check_output(
+                          ['git', 'diff', 'HEAD~1', '--name-only'],
+                          stderr=subprocess.DEVNULL
+                      ).decode().strip().split('\n')
+                  except Exception:
+                      diff = []
+
+                  # Determine which agents changed
+                  changed = set()
+                  rebuild_all = False
+                  for f in diff:
+                      if f.startswith('agents/'):
+                          parts = f.split('/')
+                          if len(parts) >= 2:
+                              changed.add(parts[1])
+                      elif f.startswith('shared/') or f.startswith('infra-cdk/'):
+                          rebuild_all = True
+
+                  if rebuild_all or not diff or not changed:
+                      targets = all_agents
+                      print(f'Building ALL {len(targets)} agents (shared files changed or first run)')
+                  else:
+                      targets = [a for a in all_agents if a in changed]
+                      print(f'Building {len(targets)} changed agent(s): {targets}')
+
+                  with open('changed_agents.json', 'w') as f:
+                      json.dump(targets, f)
+                  "
+            build:
+              commands:
+                - echo "Building changed agents..."
+                - |
+                  set -e
+                  REPO_NAME=$(echo $ECR_REPO | cut -d'/' -f2-)
+                  for AGENT_NAME in $(python3 -c "import json; [print(a) for a in json.load(open('changed_agents.json'))]"); do
+                    AGENT_DIR="agents/${AGENT_NAME}"
+                    if [ ! -d "$AGENT_DIR" ]; then
+                      echo "WARN: No directory for agent ${AGENT_NAME}, skipping"
+                      continue
+                    fi
+                    AGENT_TAG="${ECR_REPO}:${AGENT_NAME}-${COMMIT_SHA}"
+                    # Skip if tag already exists (immutable tags)
+                    if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="${AGENT_NAME}-${COMMIT_SHA}" --region $AWS_DEFAULT_REGION &>/dev/null; then
+                      echo "  ${AGENT_NAME}: tag already exists, skipping build"
+                      continue
+                    fi
+                    echo "Building ${AGENT_NAME}..."
+                    if [ -f "${AGENT_DIR}/Dockerfile" ]; then
+                      docker build -t $AGENT_TAG -f ${AGENT_DIR}/Dockerfile .
+                    else
+                      echo "No Dockerfile for ${AGENT_NAME}, skipping docker build"
+                      continue
+                    fi
+                    docker push $AGENT_TAG
+                    echo "Pushed ${AGENT_TAG}"
+                  done
+            post_build:
+              commands:
+                - echo "{\"commit\":\"$COMMIT_SHA\"}" > build-output.json
+          artifacts:
+            files:
+              - build-output.json
+              - changed_agents.json
+              - "**/*"
+            base-directory: .
+
+  # =========================================================================
+  # Promotion Pipeline - Evaluate Agent (runs against dev runtime)
+  # =========================================================================
+
+  PipelineDeployDevAndEvalRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "logs, bedrock, bedrock-agentcore, and cognito-idp actions are account-level APIs that require Resource '*'"
+    Properties:
+      RoleName: !Sub '${ProjectName}-deploy-dev-and-eval'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EvalAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # logs:CreateLogGroup/Stream/PutLogEvents do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/OrganizationAccountAccessRole'
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/${ProjectName}-pipeline-cross-account'
+              # Amazon Bedrock and Amazon Bedrock AgentCore IAM actions
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeRuntime
+                  - bedrock-agentcore:CreateOnlineEvaluationConfig
+                  - bedrock-agentcore:DeleteOnlineEvaluationConfig
+                  - bedrock-agentcore:Evaluate
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:ListEvaluators
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+              # logs:StartQuery/GetQueryResults/StopQuery do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: '*'
+              # cognito-idp:InitiateAuth — cross-account, no pool ARN available
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackName}/*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/cdk-*'
+
+  PipelineDeployDevAndEvalProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-dev-and-eval'
+      ServiceRole: !GetAtt PipelineDeployDevAndEvalRole.Arn
+      TimeoutInMinutes: 45
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: DEV_ACCOUNT_ID
+            Value: !Ref DevAccountId
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: COGNITO_POOL_ID
+            Value: !Ref CognitoUserPoolId
+          - Name: COGNITO_CLIENT_ID
+            Value: !Ref CognitoClientId
+          - Name: COGNITO_DOMAIN
+            Value: !Ref CognitoUserPoolDomain
+          - Name: MACHINE_CLIENT_ID
+            Value: !Ref DevMachineClientId
+          - Name: MACHINE_CLIENT_DESCRIBE_ROLE_ARN
+            Value: !Ref MachineClientDescribeRoleArn
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - pip install boto3 pyyaml bedrock-agentcore requests
+                - npm install -g aws-cdk
+            pre_build:
+              commands:
+                - COMMIT_SHA=$(cat build-output.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit','latest'))")
+                - echo "Assuming role into dev account..."
+                - >
+                  CREDS=$(aws sts assume-role
+                  --role-arn arn:aws:iam::${DEV_ACCOUNT_ID}:role/${PROJECT_NAME}-pipeline-cross-account
+                  --role-session-name eval-test
+                  --query Credentials --output json)
+                - export AWS_ACCESS_KEY_ID=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['AccessKeyId'])")
+                - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['SecretAccessKey'])")
+                - export AWS_SESSION_TOKEN=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['SessionToken'])")
+                - export CDK_DEFAULT_ACCOUNT=$DEV_ACCOUNT_ID
+                - export CDK_DEFAULT_REGION=$AWS_DEFAULT_REGION
+            build:
+              commands:
+                - echo "Deploy to dev + eval with rollback..."
+                - |
+                  CHANGED=$(python3 -c "import json; [print(a) for a in json.load(open('changed_agents.json'))]")
+                  if [ -z "$CHANGED" ]; then
+                    echo "No changed agents"
+                    echo '{"agents":{},"all_passed":true}' > eval-results.json
+                    exit 0
+                  fi
+
+                  # Step 1: Deploy new code to dev
+                  echo ""
+                  echo "=== Step 1: Deploy to dev ==="
+                  cd infra-cdk && npm install --silent 2>/dev/null && cd ..
+                  cdk bootstrap aws://$DEV_ACCOUNT_ID/$AWS_DEFAULT_REGION --quiet 2>/dev/null || true
+                  cd infra-cdk
+                  for AGENT_NAME in $CHANGED; do
+                    # Save current deploy version for rollback
+                    PREV_VERSION=$(aws ssm get-parameter --name "/${STACK_NAME}/agents/${AGENT_NAME}/deploy-version" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+                    echo "  Deploying $AGENT_NAME (prev: ${PREV_VERSION:-none})..."
+                    cdk deploy --all \
+                      --context stack_name=$STACK_NAME \
+                      --context cognito_user_pool_id=$COGNITO_POOL_ID \
+                      --context cognito_user_pool_client_id=$COGNITO_CLIENT_ID \
+                      --context cognito_user_pool_domain=$COGNITO_DOMAIN \
+                      --context machine_client_id=$MACHINE_CLIENT_ID \
+                      --context machine_client_describe_role_arn=$MACHINE_CLIENT_DESCRIBE_ROLE_ARN \
+                      --context target_agent=$AGENT_NAME \
+                      --require-approval never
+                  done
+                  cd ..
+                  echo "  Dev deploy complete."
+
+                  # Wait for runtime to become ready (poll up to ~2.5 min)
+                  echo "  Waiting for runtimes to stabilize..."
+                  sleep 15
+                  for i in $(seq 1 8); do
+                    READY=true
+                    for AGENT_NAME in $CHANGED; do
+                      RUNTIME_ARN=$(aws ssm get-parameter --name "/${STACK_NAME}/agents/${AGENT_NAME}/runtime-arn" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+                      if [ -n "$RUNTIME_ARN" ]; then
+                        RUNTIME_ID=$(echo $RUNTIME_ARN | grep -o '[^/]*$')
+                        STATUS=$(aws bedrock-agentcore-control get-agent-runtime \
+                          --agent-runtime-id "$RUNTIME_ID" \
+                          --query 'status' --output text 2>/dev/null || echo "UNKNOWN")
+                        if [ "$STATUS" != "READY" ]; then
+                          READY=false
+                          echo "  $AGENT_NAME: $STATUS (attempt $i/8)"
+                        fi
+                      fi
+                    done
+                    if [ "$READY" = "true" ]; then
+                      echo "  All runtimes ready."
+                      break
+                    fi
+                    sleep 15
+                  done
+
+                  # Step 2: Eval against live dev runtime
+                  echo ""
+                  echo "=== Step 2: Evaluate against dev ==="
+                  ALL_PASSED=true
+                  for AGENT_NAME in $CHANGED; do
+                    echo ""
+                    echo "--- Evaluating: $AGENT_NAME ---"
+                    RUNTIME_ARN=$(aws ssm get-parameter --name "/${STACK_NAME}/agents/${AGENT_NAME}/runtime-arn" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+                    if [ -z "$RUNTIME_ARN" ]; then
+                      echo "  WARN: No runtime found, skipping"
+                      continue
+                    fi
+                    echo "  Runtime: $RUNTIME_ARN"
+                    EVAL_ARGS="--runtime-arn $RUNTIME_ARN --region $AWS_DEFAULT_REGION --agent-name $AGENT_NAME --stack-name $STACK_NAME"
+                    EVAL_DIR="agents/${AGENT_NAME}/eval"
+                    if [ -d "$EVAL_DIR" ] && ls "$EVAL_DIR"/*.yaml "$EVAL_DIR"/*.yml "$EVAL_DIR"/*.json 2>/dev/null | grep -q .; then
+                      EVAL_ARGS="$EVAL_ARGS --eval-cases-dir $EVAL_DIR"
+                      echo "  Eval cases: $EVAL_DIR"
+                    else
+                      echo "  No eval cases found at $EVAL_DIR (using script defaults)"
+                    fi
+                    if python3 scripts/pipeline_eval.py $EVAL_ARGS; then
+                      echo "  Result: PASSED"
+                      aws ssm put-parameter --name "/${STACK_NAME}/agents/${AGENT_NAME}/deploy-version" --value "$COMMIT_SHA" --type String --overwrite 2>/dev/null || true
+                    else
+                      echo "  Result: FAILED"
+                      ALL_PASSED=false
+                    fi
+                  done
+
+                  # Always write eval-results/_summary.json
+                  mkdir -p eval-results
+                  if [ ! -f eval-results/_summary.json ]; then
+                    echo "{\"agents\":{},\"all_passed\":$ALL_PASSED}" > eval-results/_summary.json
+                  fi
+
+                  # Step 3: Rollback if eval failed
+                  if [ "$ALL_PASSED" = "false" ]; then
+                    echo ""
+                    echo "=== Step 3: Rolling back dev ==="
+                    cd infra-cdk
+                    for AGENT_NAME in $CHANGED; do
+                      echo "  Rolling back $AGENT_NAME..."
+                      cdk deploy --all \
+                        --context stack_name=$STACK_NAME \
+                        --context cognito_user_pool_id=$COGNITO_POOL_ID \
+                        --context cognito_user_pool_client_id=$COGNITO_CLIENT_ID \
+                        --context cognito_user_pool_domain=$COGNITO_DOMAIN \
+                        --context machine_client_id=$MACHINE_CLIENT_ID \
+                        --context machine_client_describe_role_arn=$MACHINE_CLIENT_DESCRIBE_ROLE_ARN \
+                        --context target_agent=$AGENT_NAME \
+                        --require-approval never 2>/dev/null || true
+                    done
+                    cd ..
+                    echo "  Rollback complete."
+                    echo ""
+                    echo "ERROR: Eval failed — dev rolled back"
+                    exit 1
+                  fi
+
+                  echo ""
+                  echo "All agents passed evaluation. Dev is running validated code."
+            post_build:
+              commands:
+                - ls eval-results/ 2>/dev/null && cat eval-results/*.json 2>/dev/null || echo '{"note":"no eval results file"}'
+          artifacts:
+            files:
+              - eval-results/**/*
+              - changed_agents.json
+              - "**/*"
+            base-directory: .
+
+  # =========================================================================
+  # Promotion Pipeline - Deploy to Environment (cross-account CDK)
+  # =========================================================================
+
+  PipelineDeployRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "logs:CreateLogGroup/Stream/PutLogEvents are account-level APIs that require Resource '*'"
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-deploy'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # logs:CreateLogGroup/Stream/PutLogEvents do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/OrganizationAccountAccessRole'
+                  - !Sub 'arn:aws:iam::${StagingAccountId}:role/OrganizationAccountAccessRole'
+                  - !Sub 'arn:aws:iam::${ProdAccountId}:role/OrganizationAccountAccessRole'
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/${ProjectName}-pipeline-cross-account'
+                  - !Sub 'arn:aws:iam::${StagingAccountId}:role/${ProjectName}-pipeline-cross-account'
+                  - !Sub 'arn:aws:iam::${ProdAccountId}:role/${ProjectName}-pipeline-cross-account'
+                  - !Sub 'arn:aws:iam::${DevAccountId}:role/cdk-*'
+                  - !Sub 'arn:aws:iam::${StagingAccountId}:role/cdk-*'
+                  - !Sub 'arn:aws:iam::${ProdAccountId}:role/cdk-*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackName}/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+
+  DeployToStagingProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-staging'
+      ServiceRole: !GetAtt PipelineDeployRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: TARGET_ACCOUNT_ID
+            Value: !Ref StagingAccountId
+          - Name: TARGET_ENV
+            Value: staging
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: COGNITO_POOL_ID
+            Value: !Ref CognitoUserPoolId
+          - Name: COGNITO_CLIENT_ID
+            Value: !Ref CognitoClientId
+          - Name: COGNITO_DOMAIN
+            Value: !Ref CognitoUserPoolDomain
+          - Name: MACHINE_CLIENT_ID
+            Value: !Ref StagingMachineClientId
+          - Name: MACHINE_CLIENT_DESCRIBE_ROLE_ARN
+            Value: !Ref MachineClientDescribeRoleArn
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - pip install pyyaml
+                - npm install -g aws-cdk
+            build:
+              commands:
+                - echo "Deploying changed agents to $TARGET_ENV ($TARGET_ACCOUNT_ID)..."
+                - >
+                  CREDS=$(aws sts assume-role
+                  --role-arn arn:aws:iam::${TARGET_ACCOUNT_ID}:role/${PROJECT_NAME}-pipeline-cross-account
+                  --role-session-name pipeline-deploy
+                  --query Credentials --output json)
+                - export AWS_ACCESS_KEY_ID=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['AccessKeyId'])")
+                - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['SecretAccessKey'])")
+                - export AWS_SESSION_TOKEN=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['SessionToken'])")
+                - export CDK_DEFAULT_ACCOUNT=$TARGET_ACCOUNT_ID
+                - export CDK_DEFAULT_REGION=$AWS_DEFAULT_REGION
+                - |
+                  cd infra-cdk && npm install --silent 2>/dev/null
+                  cdk bootstrap aws://$TARGET_ACCOUNT_ID/$AWS_DEFAULT_REGION --quiet 2>/dev/null || true
+                  CHANGED=$(python3 -c "import json; print(' '.join(json.load(open('../changed_agents.json'))))")
+                  for AGENT in $CHANGED; do
+                    echo "Deploying agent: $AGENT"
+                    cdk deploy --all \
+                      --context stack_name=$STACK_NAME \
+                      --context cognito_user_pool_id=$COGNITO_POOL_ID \
+                      --context cognito_user_pool_client_id=$COGNITO_CLIENT_ID \
+                      --context cognito_user_pool_domain=$COGNITO_DOMAIN \
+                      --context machine_client_id=$MACHINE_CLIENT_ID \
+                      --context machine_client_describe_role_arn=$MACHINE_CLIENT_DESCRIBE_ROLE_ARN \
+                      --context target_agent=$AGENT \
+                      --require-approval never
+                  done
+            post_build:
+              commands:
+                - echo "Deploy to $TARGET_ENV complete."
+
+  DeployToProdProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-prod'
+      ServiceRole: !GetAtt PipelineDeployRole.Arn
+      TimeoutInMinutes: 30
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: TARGET_ACCOUNT_ID
+            Value: !Ref ProdAccountId
+          - Name: TARGET_ENV
+            Value: prod
+          - Name: STACK_NAME
+            Value: !Ref StackName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: COGNITO_POOL_ID
+            Value: !Ref CognitoUserPoolId
+          - Name: COGNITO_CLIENT_ID
+            Value: !Ref CognitoClientId
+          - Name: COGNITO_DOMAIN
+            Value: !Ref CognitoUserPoolDomain
+          - Name: MACHINE_CLIENT_ID
+            Value: !Ref ProdMachineClientId
+          - Name: MACHINE_CLIENT_DESCRIBE_ROLE_ARN
+            Value: !Ref MachineClientDescribeRoleArn
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - pip install pyyaml
+                - npm install -g aws-cdk
+            build:
+              commands:
+                - echo "Deploying changed agents to $TARGET_ENV ($TARGET_ACCOUNT_ID)..."
+                - >
+                  CREDS=$(aws sts assume-role
+                  --role-arn arn:aws:iam::${TARGET_ACCOUNT_ID}:role/${PROJECT_NAME}-pipeline-cross-account
+                  --role-session-name pipeline-deploy
+                  --query Credentials --output json)
+                - export AWS_ACCESS_KEY_ID=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['AccessKeyId'])")
+                - export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['SecretAccessKey'])")
+                - export AWS_SESSION_TOKEN=$(echo $CREDS | python3 -c "import sys,json; print(json.load(sys.stdin)['SessionToken'])")
+                - export CDK_DEFAULT_ACCOUNT=$TARGET_ACCOUNT_ID
+                - export CDK_DEFAULT_REGION=$AWS_DEFAULT_REGION
+                - |
+                  cd infra-cdk && npm install --silent 2>/dev/null
+                  cdk bootstrap aws://$TARGET_ACCOUNT_ID/$AWS_DEFAULT_REGION --quiet 2>/dev/null || true
+                  CHANGED=$(python3 -c "import json; print(' '.join(json.load(open('../changed_agents.json'))))")
+                  for AGENT in $CHANGED; do
+                    echo "Deploying agent: $AGENT"
+                    cdk deploy --all \
+                      --context stack_name=$STACK_NAME \
+                      --context cognito_user_pool_id=$COGNITO_POOL_ID \
+                      --context cognito_user_pool_client_id=$COGNITO_CLIENT_ID \
+                      --context cognito_user_pool_domain=$COGNITO_DOMAIN \
+                      --context machine_client_id=$MACHINE_CLIENT_ID \
+                      --context machine_client_describe_role_arn=$MACHINE_CLIENT_DESCRIBE_ROLE_ARN \
+                      --context target_agent=$AGENT \
+                      --require-approval never
+                  done
+            post_build:
+              commands:
+                - echo "Deploy to $TARGET_ENV complete."
+
+  # =========================================================================
+  # Promotion Pipeline - CodePipeline
+  # =========================================================================
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt PipelineBuildProject.Arn
+                  - !GetAtt PipelineDeployDevAndEvalProject.Arn
+                  - !GetAtt DeployToStagingProject.Arn
+                  - !GetAtt DeployToProdProject.Arn
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt AgentSourceRepo.Arn
+
+  PromotionPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-agent-promotion'
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !GetAtt AgentSourceRepo.Name
+                BranchName: main
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAgent
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref PipelineBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: DeployDevAndEval
+          OnFailure:
+            Result: RETRY
+          Actions:
+            - Name: DeployDevAndEval
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref PipelineDeployDevAndEvalProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: EvalOutput
+        - Name: ApproveStaging
+          Actions:
+            - Name: ApproveForStaging
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: 'Agent eval passed in dev. Approve promotion to staging?'
+        - Name: DeployStaging
+          Actions:
+            - Name: DeployToStaging
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployToStagingProject
+              InputArtifacts:
+                - Name: BuildOutput
+        - Name: ApproveProd
+          Actions:
+            - Name: ApproveForProd
+              ActionTypeId:
+                Category: Approval
+                Owner: AWS
+                Provider: Manual
+                Version: '1'
+              Configuration:
+                CustomData: 'Agent deployed to staging. Approve promotion to prod (merges to main)?'
+        - Name: DeployProd
+          Actions:
+            - Name: DeployToProd
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref DeployToProdProject
+              InputArtifacts:
+                - Name: BuildOutput
+
+  # =========================================================================
+  # EventBridge - Trigger pipeline on CodeCommit push to dev
+  # =========================================================================
+
+  PipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-trigger'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PromotionPipeline}'
+
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-codecommit-trigger'
+      Description: Trigger promotion pipeline on push to main (enable after initial deploy)
+      State: DISABLED
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt AgentSourceRepo.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PromotionPipeline}'
+          Id: PromotionPipeline
+          RoleArn: !GetAtt PipelineTriggerRole.Arn
+
+Outputs:
+  SharedToolingCrossAccountRoleArn:
+    Value: !GetAtt SharedToolingCrossAccountRole.Arn
+    Export:
+      Name: !Sub '${ProjectName}-shared-tooling-role-arn'
+  AgentImageRepositoryUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentImageRepository}'
+    Export:
+      Name: !Sub '${ProjectName}-agent-image-repo-uri'
+  PipelineArtifactBucketName:
+    Value: !Ref PipelineArtifactBucket
+    Export:
+      Name: !Sub '${ProjectName}-pipeline-artifacts'
+  PromotionPipelineUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PromotionPipeline}/view'
+  CodeCommitRepoUrl:
+    Value: !GetAtt AgentSourceRepo.CloneUrlHttp
+    Export:
+      Name: !Sub '${ProjectName}-codecommit-url'
+  CodeCommitRepoSshUrl:
+    Value: !GetAtt AgentSourceRepo.CloneUrlSsh
+  CodeCommitRepoArn:
+    Value: !GetAtt AgentSourceRepo.Arn

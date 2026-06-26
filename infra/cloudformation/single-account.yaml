@@ -1,0 +1,1025 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: '2010-09-09'
+# cfn-guard suppression: IAM_NO_INLINE_POLICY_CHECK — inline policies are used
+# intentionally to keep role definitions self-contained within the template.
+# This is standard practice for CloudFormation-managed roles.
+Description: >-
+  Agentic AI Platform - Single Account.
+
+Metadata:
+  DataClassification:
+    CognitoUserPool: "Confidential - User authentication credentials (encrypted at rest by AWS-managed keys)"
+    PipelineArtifactBucket: "Internal - Build artifacts and source code (KMS encrypted, 30-day lifecycle)"
+    AgentImageRepository: "Internal - Container images (KMS encrypted, image scanning enabled)"
+    GatewayMachineClient: "Secret - OAuth2 client credentials (managed by AgentCore Identity Token Vault)"
+    SecretManager: "Secret - Pipeline eval credentials (KMS encrypted, scoped access)"
+  HandlingProcedures:
+    EncryptionAtRest: "All data encrypted using AWS KMS or AES256"
+    EncryptionInTransit: "All API calls use HTTPS/TLS; S3 bucket policies deny non-TLS requests"
+    AccessLogging: "S3 access logging to dedicated AccessLogsBucket; ECR via CloudTrail"
+    SecurityDocumentation: "See docs/ai-security-and-compliance.md for full security controls"
+
+Parameters:
+  ProjectName:
+    Description: Prefix for platform resources (pipeline, ECR, CodeCommit, Cognito, IAM, SSM, Secrets).
+    Type: String
+    Default: agentic-ai-platform-single
+  CdkStackName:
+    Description: Prefix for CDK-owned AgentCore stacks (gateway + per-agent) and runtime SSM keys.
+    Type: String
+    Default: fastagent-single
+
+Resources:
+
+  # =========================================================================
+  # Identity — Cognito User Pool
+  # =========================================================================
+
+  # Cognito User Pools encrypt all data at rest using AWS-managed keys by default.
+  # Custom KMS keys for Cognito are not supported via CloudFormation.
+  # See: https://docs.aws.amazon.com/cognito/latest/developerguide/data-protection.html
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-client'
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+
+  CognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # -------------------------------------------------------------------------
+  # M2M (Gateway) auth — Resource Server + Machine Client + Secret
+  # -------------------------------------------------------------------------
+  # CDK (gateway-stack.ts) imports these via --context and uses them to:
+  #   - Configure the AgentCore Gateway JWT authorizer
+  #   - Register the OAuth2 Credential Provider in AgentCore Identity
+  # Keeping Cognito identity resources in CFN means `cdk deploy` can't
+  # accidentally delete them if context is missing.
+  GatewayResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub '${ProjectName}-gateway'
+      Name: !Sub '${ProjectName}-gateway-resource-server'
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read access to gateway
+        - ScopeName: write
+          ScopeDescription: Write access to gateway
+
+  GatewayMachineClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GatewayResourceServer
+    Properties:
+      ClientName: !Sub '${ProjectName}-machine-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - !Sub '${ProjectName}-gateway/read'
+        - !Sub '${ProjectName}-gateway/write'
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # Note: the Cognito machine client secret is NOT copied into Secrets Manager.
+  # The AgentCore oauth2 provider custom resource reads it directly via
+  # cognito-idp:DescribeUserPoolClient at registration time.
+
+  # =========================================================================
+  # Container Registry
+  # =========================================================================
+
+  # ECR API access logging is provided by AWS CloudTrail at the account level.
+  # The enterprise deployment enables CloudTrail via the management account stack.
+  # For single-account deployments, ensure CloudTrail is enabled in the account.
+  AgentImageRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}/agents'
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {"rules":[{"rulePriority":1,"description":"Keep last 10 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":10},"action":{"type":"expire"}}]}
+
+  # =========================================================================
+  # CI/CD — CodeCommit, Pipeline, Eval
+  # =========================================================================
+
+  AgentSourceRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-agents'
+      RepositoryDescription: Agent source code repository
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    # checkov:skip=CKV_AWS_18: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_LOGGING_ENABLED: "This is the access logging destination bucket; S3 does not allow a bucket to log to itself"
+    Properties:
+      BucketName: !Sub '${ProjectName}-access-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub '${AccessLogsBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  PipelineArtifactBucket:
+    Type: AWS::S3::Bucket
+    # ObjectLockEnabled is not set — pipeline artifacts are ephemeral (30-day lifecycle)
+    # and do not require WORM protection. PublicAccessBlock prevents public ACLs.
+    # MFA Delete: Cannot be enabled via CloudFormation (requires root account + CLI).
+    # For production, enable post-deployment:
+    #   aws s3api put-bucket-versioning --bucket <bucket> \
+    #     --versioning-configuration Status=Enabled,MFADelete=Enabled \
+    #     --mfa "arn:aws:iam::<account>:mfa/root-mfa <code>"
+    Metadata:
+      guard:
+        SuppressedRules:
+          - S3_BUCKET_DEFAULT_LOCK_ENABLED: "Pipeline artifacts are ephemeral with 30-day expiry; object lock is not appropriate"
+          - S3_BUCKET_NO_PUBLIC_RW_ACL: "PublicAccessBlockConfiguration blocks all public access; explicit ACL property is not needed"
+    Properties:
+      BucketName: !Sub '${ProjectName}-pipeline-artifacts-${AWS::AccountId}'
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: pipeline-artifacts/
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  PipelineArtifactBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PipelineArtifactBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt PipelineArtifactBucket.Arn
+              - !Sub '${PipelineArtifactBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # =========================================================================
+  # Pipeline Roles
+  # =========================================================================
+
+  PipelineBuildRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "logs:CreateLogGroup/Stream/PutLogEvents and ecr:GetAuthorizationToken are account-level APIs that require Resource '*'"
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline-build'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # logs:CreateLogGroup/Stream/PutLogEvents do not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              # ecr:GetAuthorizationToken does not support resource-level permissions
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:DescribeImages
+                Resource: !GetAtt AgentImageRepository.Arn
+
+  PipelineDeployAndEvalRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "logs, bedrock, bedrock-agentcore, and cloudwatch actions are account-level APIs that require Resource '*'"
+    # checkov:skip=CKV_AWS_109: "iam:PassRole and iam:GetRole scoped to project and CDK role name patterns"
+    Properties:
+      RoleName: !Sub '${ProjectName}-deploy-and-eval'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeployAndEvalAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:StartQuery
+                  - logs:GetQueryResults
+                  - logs:StopQuery
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${PipelineArtifactBucket.Arn}/*'
+              # Amazon Bedrock and Amazon Bedrock AgentCore IAM actions
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeRuntime
+                  - bedrock-agentcore:GetAgentRuntime
+                  - bedrock-agentcore:Evaluate
+                  - bedrock-agentcore:GetEvaluator
+                  - bedrock-agentcore:ListEvaluators
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:InitiateAuth
+                Resource:
+                  - !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource:
+                  # Platform-owned params (Cognito IDs, etc.)
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+                  # CDK-owned params (runtime-arn, memory-arn per agent)
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${CdkStackName}/*'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${ProjectName}/*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/${CdkStackName}/*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/agentic-ai-platform-single/*'
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:GetTemplateSummary
+                  - cloudformation:ListStacks
+                Resource:
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${CdkStackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+                  - !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/CDKToolkit/*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                  - iam:GetRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/${CdkStackName}-*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource:
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/cdk-*'
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-pipeline'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt PipelineArtifactBucket.Arn
+                  - !Sub '${PipelineArtifactBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt AgentSourceRepo.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt PipelineBuildProject.Arn
+                  - !GetAtt PipelineDeployAndEvalProject.Arn
+
+  # =========================================================================
+  # CodeBuild Projects
+  # =========================================================================
+
+  PipelineBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-build'
+      ServiceRole: !GetAtt PipelineBuildRole.Arn
+      EncryptionKey: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+      TimeoutInMinutes: 15
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO
+            Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}/agents'
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - pip install pyyaml
+            pre_build:
+              commands:
+                - echo "Logging in to ECR..."
+                - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+                - COMMIT_SHA=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-8)
+                - echo "Detecting changed agents..."
+                - |
+                  python3 -c "
+                  import yaml, json, subprocess, os, glob, re
+
+                  all_agents = []
+                  for agent_yaml in sorted(glob.glob('agents/*/agent.yaml')):
+                      name = agent_yaml.split('/')[1]
+                      if not re.match(r'^[a-zA-Z0-9_-]+$', name):
+                          print(f'WARN: Skipping invalid agent name: {name}')
+                          continue
+                      all_agents.append(name)
+
+                  if not all_agents:
+                      print('No agents found in agents/*/agent.yaml')
+                      json.dump([], open('changed_agents.json', 'w'))
+                      raise SystemExit(0)
+
+                  try:
+                      diff = subprocess.check_output(
+                          ['git', 'diff', 'HEAD~1', '--name-only'],
+                          stderr=subprocess.DEVNULL
+                      ).decode().strip().split('\n')
+                  except Exception:
+                      diff = []
+
+                  changed = set()
+                  rebuild_all = False
+                  for f in diff:
+                      if f.startswith('agents/'):
+                          parts = f.split('/')
+                          if len(parts) >= 2:
+                              changed.add(parts[1])
+                      elif f.startswith('shared/') or f.startswith('infra-cdk/'):
+                          rebuild_all = True
+
+                  if rebuild_all or not diff or not changed:
+                      targets = all_agents
+                      print(f'Building ALL {len(targets)} agents (shared files changed or first run)')
+                  else:
+                      targets = [a for a in all_agents if a in changed]
+                      print(f'Building {len(targets)} changed agent(s): {targets}')
+
+                  with open('changed_agents.json', 'w') as f:
+                      json.dump(targets, f)
+                  "
+            build:
+              commands:
+                - echo "Building changed agents..."
+                - |
+                  set -e
+                  REPO_NAME=$(echo $ECR_REPO | cut -d'/' -f2-)
+                  for AGENT_NAME in $(python3 -c "import json; [print(a) for a in json.load(open('changed_agents.json'))]"); do
+                    AGENT_DIR="agents/${AGENT_NAME}"
+                    if [ ! -d "$AGENT_DIR" ]; then
+                      echo "WARN: No directory for agent ${AGENT_NAME}, skipping"
+                      continue
+                    fi
+                    AGENT_TAG="${ECR_REPO}:${AGENT_NAME}-${COMMIT_SHA}"
+                    if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="${AGENT_NAME}-${COMMIT_SHA}" --region $AWS_DEFAULT_REGION &>/dev/null; then
+                      echo "  ${AGENT_NAME}: tag already exists, skipping build"
+                      continue
+                    fi
+                    echo "Building ${AGENT_NAME}..."
+                    if [ -f "${AGENT_DIR}/Dockerfile" ]; then
+                      docker build -t $AGENT_TAG -f ${AGENT_DIR}/Dockerfile .
+                    else
+                      echo "No Dockerfile for ${AGENT_NAME}, skipping docker build"
+                      continue
+                    fi
+                    docker push $AGENT_TAG
+                    echo "Pushed ${AGENT_TAG}"
+                  done
+            post_build:
+              commands:
+                - echo "{\"commit\":\"$COMMIT_SHA\"}" > build-output.json
+          artifacts:
+            files:
+              - build-output.json
+              - changed_agents.json
+              - "**/*"
+            base-directory: .
+
+  PipelineDeployAndEvalProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub '${ProjectName}-deploy-and-eval'
+      ServiceRole: !GetAtt PipelineDeployAndEvalRole.Arn
+      EncryptionKey: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/aws/s3'
+      TimeoutInMinutes: 45
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: STACK_NAME
+            # CDK stack prefix — used for `cdk deploy --context stack_name=…`
+            # and for reading runtime SSM keys written by CDK
+            # (`/{CdkStackName}/agents/{agent}/runtime-arn`).
+            Value: !Ref CdkStackName
+          - Name: PROJECT_NAME
+            Value: !Ref ProjectName
+          - Name: PLATFORM_STACK
+            # CFN stack name. Pipeline reads Cognito SSM + eval credentials
+            # under this prefix and describe-stacks on this stack for
+            # Cognito outputs.
+            Value: !Ref AWS::StackName
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 20
+              commands:
+                - pip install boto3 pyyaml bedrock-agentcore requests
+                - npm install -g aws-cdk
+            pre_build:
+              commands:
+                - COMMIT_SHA=$(cat build-output.json | python3 -c "import sys,json; print(json.load(sys.stdin).get('commit','latest'))")
+            build:
+              commands:
+                - |
+                  CHANGED=$(python3 -c "import json; [print(a) for a in json.load(open('changed_agents.json'))]")
+                  if [ -z "$CHANGED" ]; then
+                    echo "No changed agents"
+                    echo '{"agents":{},"all_passed":true}' > eval-results.json
+                    exit 0
+                  fi
+
+                  # Deploy
+                  echo "=== Deploy ==="
+                  # Cognito + machine client are CFN-owned in the platform stack.
+                  # PLATFORM_STACK is provided as a CodeBuild env var (set from
+                  # AWS::StackName), which can differ from STACK_NAME.
+                  COGNITO_POOL_ID=$(aws cloudformation describe-stacks --stack-name "$PLATFORM_STACK" --query "Stacks[0].Outputs[?OutputKey=='CognitoUserPoolId'].OutputValue" --output text 2>/dev/null || echo "")
+                  COGNITO_CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$PLATFORM_STACK" --query "Stacks[0].Outputs[?OutputKey=='CognitoClientId'].OutputValue" --output text 2>/dev/null || echo "")
+                  COGNITO_DOMAIN=$(aws cloudformation describe-stacks --stack-name "$PLATFORM_STACK" --query "Stacks[0].Outputs[?OutputKey=='CognitoDomain'].OutputValue" --output text 2>/dev/null || echo "")
+                  MACHINE_CLIENT_ID=$(aws cloudformation describe-stacks --stack-name "$PLATFORM_STACK" --query "Stacks[0].Outputs[?OutputKey=='MachineClientId'].OutputValue" --output text 2>/dev/null || echo "")
+
+                  if [ -z "$COGNITO_POOL_ID" ] || [ -z "$COGNITO_CLIENT_ID" ] || [ -z "$COGNITO_DOMAIN" ] || [ -z "$MACHINE_CLIENT_ID" ]; then
+                    echo "ERROR: Missing required CFN outputs from ${PLATFORM_STACK}."
+                    echo "  CognitoUserPoolId:      ${COGNITO_POOL_ID:-<empty>}"
+                    echo "  CognitoClientId:        ${COGNITO_CLIENT_ID:-<empty>}"
+                    echo "  CognitoDomain:          ${COGNITO_DOMAIN:-<empty>}"
+                    echo "  MachineClientId:        ${MACHINE_CLIENT_ID:-<empty>}"
+                    exit 1
+                  fi
+
+                  cd infra-cdk && npm install --silent 2>/dev/null && cd ..
+                  cdk bootstrap --quiet 2>/dev/null || true
+                  cd infra-cdk
+                  for AGENT_NAME in $CHANGED; do
+                    echo "  Deploying ${STACK_NAME}-agent-${AGENT_NAME} + ${STACK_NAME}-gateway..."
+                    # --all ensures the shared Gateway stack stays in sync, but
+                    # --context target_agent=... limits per-agent stacks to the one changed.
+                    cdk deploy --all \
+                      --context stack_name=$STACK_NAME \
+                      --context cognito_user_pool_id=$COGNITO_POOL_ID \
+                      --context cognito_user_pool_client_id=$COGNITO_CLIENT_ID \
+                      --context cognito_user_pool_domain=$COGNITO_DOMAIN \
+                      --context machine_client_id=$MACHINE_CLIENT_ID \
+                      --context target_agent=$AGENT_NAME \
+                      --require-approval never
+                  done
+                  cd ..
+
+                  # Wait for runtime
+                  echo "  Waiting for runtime..."
+                  sleep 15
+                  for i in $(seq 1 8); do
+                    READY=true
+                    for AGENT_NAME in $CHANGED; do
+                      RUNTIME_ARN=$(aws ssm get-parameter --name "/${STACK_NAME}/agents/${AGENT_NAME}/runtime-arn" --query 'Parameter.Value' --output text 2>/dev/null || echo "")
+                      if [ -n "$RUNTIME_ARN" ]; then
+                        RUNTIME_ID=$(echo $RUNTIME_ARN | grep -o '[^/]*$')
+                        STATUS=$(aws bedrock-agentcore-control get-agent-runtime --agent-runtime-id "$RUNTIME_ID" --query 'status' --output text 2>/dev/null || echo "UNKNOWN")
+                        if [ "$STATUS" != "READY" ]; then
+                          READY=false
+                        fi
+                      fi
+                    done
+                    [ "$READY" = "true" ] && break
+                    sleep 15
+                  done
+
+                  # Evaluate
+                  echo "=== Evaluate ==="
+                  echo "  CHANGED='$CHANGED'"
+                  ALL_PASSED=true
+                  for AGENT_NAME in $CHANGED; do
+                    SSM_KEY="/${STACK_NAME}/agents/${AGENT_NAME}/runtime-arn"
+                    echo "  Looking up SSM key: $SSM_KEY"
+                    RUNTIME_ARN=$(aws ssm get-parameter --name "$SSM_KEY" --query 'Parameter.Value' --output text 2>&1 || echo "")
+                    echo "  RUNTIME_ARN='$RUNTIME_ARN'"
+                    [ -z "$RUNTIME_ARN" ] && { echo "  Skipping (empty runtime arn)"; continue; }
+                    EVAL_ARGS="--runtime-arn $RUNTIME_ARN --region $AWS_DEFAULT_REGION --agent-name $AGENT_NAME --stack-name $PLATFORM_STACK"
+                    EVAL_DIR="agents/${AGENT_NAME}/eval"
+                    if [ -d "$EVAL_DIR" ] && ls "$EVAL_DIR"/*.yaml "$EVAL_DIR"/*.yml "$EVAL_DIR"/*.json 2>/dev/null | grep -q .; then
+                      EVAL_ARGS="$EVAL_ARGS --eval-cases-dir $EVAL_DIR"
+                      echo "  Eval cases: $EVAL_DIR"
+                    else
+                      echo "  No eval cases found at $EVAL_DIR (using script defaults)"
+                    fi
+                    if ! python3 scripts/pipeline_eval.py $EVAL_ARGS; then
+                      ALL_PASSED=false
+                    fi
+                  done
+
+                  if [ "$ALL_PASSED" = "false" ]; then
+                    echo "ERROR: Eval failed"
+                    exit 1
+                  fi
+            post_build:
+              commands:
+                - ls eval-results/ 2>/dev/null && cat eval-results/*.json 2>/dev/null || echo '{"note":"no eval results"}'
+          artifacts:
+            files:
+              - eval-results/**/*
+              - changed_agents.json
+              - "**/*"
+            base-directory: .
+
+  # =========================================================================
+  # CodePipeline
+  # =========================================================================
+
+  PromotionPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub '${ProjectName}-agent-promotion'
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref PipelineArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !GetAtt AgentSourceRepo.Name
+                BranchName: main
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAgents
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref PipelineBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: DeployAndEval
+          OnFailure:
+            Result: RETRY
+          Actions:
+            - Name: DeployAndEval
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref PipelineDeployAndEvalProject
+              InputArtifacts:
+                - Name: BuildOutput
+              OutputArtifacts:
+                - Name: EvalOutput
+
+  # Pipeline trigger on CodeCommit push
+  PipelineTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PromotionPipeline}'
+
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt AgentSourceRepo.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - main
+      Targets:
+        - Arn: !Sub 'arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${PromotionPipeline}'
+          RoleArn: !GetAtt PipelineTriggerRole.Arn
+          Id: TriggerPipeline
+
+  # =========================================================================
+  # Observability — Dashboard, Alarms, Eval Metrics
+  # =========================================================================
+
+  AgentDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${ProjectName}-agents'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {"type":"metric","x":0,"y":0,"width":12,"height":6,"properties":{"title":"Agent Invocations","metrics":[["${ProjectName}","AgentInvocations",{"stat":"Sum"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":12,"y":0,"width":12,"height":6,"properties":{"title":"Agent Latency (p50/p99)","metrics":[["${ProjectName}","AgentLatency",{"stat":"p50"}],["...","AgentLatency",{"stat":"p99"}]],"period":300,"region":"${AWS::Region}"}},
+            {"type":"metric","x":0,"y":6,"width":12,"height":6,"properties":{"title":"Eval Score","metrics":[["AgentPlatform/Evaluations","OverallScore","AgentName","strands-single-agent",{"stat":"Average"}]],"period":86400,"region":"${AWS::Region}","yAxis":{"left":{"min":0,"max":1}},"annotations":{"horizontal":[{"value":0.6,"label":"Threshold"}]}}},
+            {"type":"metric","x":12,"y":6,"width":12,"height":6,"properties":{"title":"Eval Latency","metrics":[["AgentPlatform/Evaluations","InvocationLatency","AgentName","strands-single-agent",{"stat":"Average"}]],"period":86400,"region":"${AWS::Region}"}}
+          ]
+        }
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-high-latency'
+      AlarmDescription: Agent p99 latency exceeds 30s
+      Namespace: !Ref ProjectName
+      MetricName: AgentLatency
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 30000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: []
+      OKActions: []
+      InsufficientDataActions: []
+
+  # =========================================================================
+  # Transaction Search — Required for AgentCore On-Demand Evaluations
+  # =========================================================================
+
+  TransactionSearchSetupRole:
+    Type: AWS::IAM::Role
+    # checkov:skip=CKV_AWS_111: "xray:Update*, logs:Put*, logs:CreateLogGroup, application-signals:StartDiscovery, and cloudtrail:CreateServiceLinkedChannel are account-level APIs that require Resource '*'"
+    # checkov:skip=CKV_AWS_109: "iam:CreateServiceLinkedRole scoped to aws-service-role/* path; broader scoping not possible as AWS services are the actual callers"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "xray, application-signals, logs, and cloudtrail actions used here are account-level APIs that do not support resource-level permissions"
+    Properties:
+      RoleName: !Sub '${ProjectName}-txn-search-setup'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: TransactionSearchSetup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:GetTraceSegmentDestination
+                  - xray:UpdateTraceSegmentDestination
+                  - xray:GetIndexingRules
+                  - xray:UpdateIndexingRule
+                  - application-signals:StartDiscovery
+                  - logs:PutRetentionPolicy
+                  - logs:CreateLogGroup
+                  - logs:PutResourcePolicy
+                  - cloudtrail:CreateServiceLinkedChannel
+                Resource: '*'
+              # When UpdateTraceSegmentDestination runs on a fresh account,
+              # the Application Signals / X-Ray services themselves need to
+              # provision their service-linked roles on the Lambda's behalf.
+              # Scoped to aws-service-role/* path with service principal Condition.
+              #
+              # Customer responsibility: Review and accept the security implications
+              # of granting iam:CreateServiceLinkedRole. Monitor IAM role creation
+              # via CloudTrail and validate that only expected SLRs are created.
+              #
+              # Monitoring and mitigation:
+              #   1. Audit existing SLRs: aws iam list-roles --query "Roles[?Path==\`/aws-service-role/\`]"
+              #   2. Set up a CloudTrail alarm on CreateServiceLinkedRole events
+              #      filtered to this Lambda's role ARN to detect unexpected SLR creation.
+              #   3. Alternative: pre-create the required SLRs (AWSServiceRoleForApplicationSignals,
+              #      AWSServiceRoleForXRay) via CloudFormation and remove this permission entirely.
+              - Effect: Allow
+                Action: iam:CreateServiceLinkedRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/*'
+                Condition:
+                  StringEquals:
+                    iam:AWSServiceName:
+                      - xray.amazonaws.com
+                      - application-signals.amazonaws.com
+                      - cloudtrail.amazonaws.com
+
+  TransactionSearchSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt TransactionSearchFunction.Arn
+      SamplingPercentage: 1.0
+
+  TransactionSearchFunction:
+    Type: AWS::Lambda::Function
+    # This is a CloudFormation Custom Resource Lambda that runs once during stack
+    # deploy/update. DLQ and VPC are not applicable for Custom Resource functions
+    # as CloudFormation manages invocation and error handling via cfnresponse.
+    # No environment variables are used; if sensitive env vars are added in the
+    # future, configure KmsKeyArn for environment variable encryption.
+    Metadata:
+      guard:
+        SuppressedRules:
+          - LAMBDA_DLQ_CHECK: "Custom Resource Lambda — CloudFormation manages retries and error handling via cfnresponse"
+          - LAMBDA_INSIDE_VPC: "Function only calls AWS APIs (X-Ray, CloudWatch Logs) and does not access VPC resources"
+    Properties:
+      FunctionName: !Sub '${ProjectName}-txn-search-setup'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      ReservedConcurrentExecutions: 1
+      Role: !GetAtt TransactionSearchSetupRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  request_type = event['RequestType']
+                  sampling_pct = float(event['ResourceProperties'].get('SamplingPercentage', 1.0))
+
+                  if request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  xray = boto3.client('xray')
+                  logs = boto3.client('logs')
+
+                  try:
+                      logs.put_resource_policy(
+                          policyName='XRayTransactionSearch',
+                          policyDocument=json.dumps({
+                              'Version': '2012-10-17',
+                              'Statement': [{
+                                  'Sid': 'AllowXRayToWriteLogs',
+                                  'Effect': 'Allow',
+                                  'Principal': {'Service': 'xray.amazonaws.com'},
+                                  'Action': ['logs:PutLogEvents', 'logs:CreateLogGroup', 'logs:CreateLogStream'],
+                                  'Resource': '*'
+                              }]
+                          })
+                      )
+                  except Exception as e:
+                      print(f'Resource policy warning: {e}')
+
+                  # UpdateTraceSegmentDestination triggers Application Signals
+                  # to create its service-linked role on our behalf on fresh
+                  # accounts. The Lambda role has unscoped
+                  # iam:CreateServiceLinkedRole for that reason — the
+                  # permission is used by the calling service, not by this
+                  # code directly. Conditions on iam:AWSServiceName don't
+                  # work here because they get evaluated against the service
+                  # making the call (ApplicationSignals), not the SLR being
+                  # created.
+                  try:
+                      xray.update_trace_segment_destination(Destination='CloudWatchLogs')
+                  except xray.exceptions.InvalidRequestException:
+                      pass  # Already set
+
+                  xray.update_indexing_rule(
+                      Name='Default',
+                      Rule={'Probabilistic': {'DesiredSamplingPercentage': sampling_pct}}
+                  )
+
+                  dest = xray.get_trace_segment_destination()
+                  status = dest.get('Destination', 'Unknown')
+                  print(f'Transaction Search configured: destination={status}, sampling={sampling_pct}%')
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Status': 'CONFIGURED',
+                      'SamplingPercentage': str(sampling_pct)
+                  })
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+Outputs:
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoClientId:
+    Value: !Ref CognitoUserPoolClient
+  CognitoDomain:
+    Value: !Sub '${ProjectName}-${AWS::AccountId}-${AWS::Region}.auth.${AWS::Region}.amazoncognito.com'
+  MachineClientId:
+    Value: !Ref GatewayMachineClient
+    Description: Cognito machine client id for Gateway M2M auth
+  AgentImageRepositoryUri:
+    Value: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AgentImageRepository}'
+  PipelineUrl:
+    # URL contains CloudFormation pseudo-parameters resolved at deploy time
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${PromotionPipeline}/view'
+  DashboardUrl:
+    # URL contains CloudFormation pseudo-parameters resolved at deploy time
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-agents'
+  CodeCommitRepoUrl:
+    Value: !GetAtt AgentSourceRepo.CloneUrlHttp

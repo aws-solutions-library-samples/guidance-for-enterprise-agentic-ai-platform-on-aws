@@ -1,0 +1,22 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+stack_name_base: fastagent
+
+admin_user_email: admin@example.com
+
+backend:
+  pattern: strands-single-agent # Available patterns: strands-single-agent, claude-agent-sdk
+  deployment_type: zip # Available deployment types: zip (default), docker. Use docker for non-Python runtimes, custom base images or claude-agent-sdk.
+  network_mode: PUBLIC # Available network modes: PUBLIC (default), VPC
+
+  # VPC configuration - required when network_mode is VPC
+  # Your VPC must have the necessary VPC endpoints for AWS services.
+  # See docs/agentcore-deployment.md for the full list of required VPC endpoints.
+  # vpc:
+  #   vpc_id: vpc-0abc1234def56789a
+  #   subnet_ids:
+  #     - subnet-aaaa1111bbbb2222c
+  #     - subnet-cccc3333dddd4444e
+  #   security_group_ids:  # Optional - a default SG is created if omitted
+  #     - sg-0abc1234def56789a

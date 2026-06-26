@@ -1,12 +1,13 @@
-### vsCode ###
-.vscode
+### IDE ###
+.vscode/
+.idea/
+*.code-workspace
 
 ### macOS ###
-# General
 .DS_Store
+**/.DS_Store
 .AppleDouble
 .LSOverride
-# Files that might appear in the root of a volume
 .DocumentRevisions-V100
 .fseventsd
 .Spotlight-V100
@@ -15,13 +16,49 @@
 .VolumeIcon.icns
 .com.apple.timemachine.donotpresent
 
+### Environment ###
+.env
+.envrc
+**/.envrc
+.venv
+
+### Node ###
 **/node_modules
 **/dist
-**/build
-**/.DS_Store
-**/.angular
-**/.idea
-cdk.out
-**/data/**.csv
+**/.vite
 
-.env
+### Build artifacts ###
+**/build
+**/cdk.out
+cdk.out
+.aws-sam
+build.toml
+*.egg-info/
+__pycache__
+
+### Python ###
+.ruff_cache
+uv.lock
+
+### Project-specific ###
+model.tar.gz
+.checksum
+.checksums/
+.build_checksum
+.lib_checksum
+.sav/
+.delete/
+.data/
+**/data/**.csv
+rvl_cdip_*
+notebooks/examples/data
+frontend/public/aws-exports.json
+scripts/zip-artifact/
+scripts/out/
+public/
+ref/
+scan-report*.json
+*inspector-config.json
+**/results/*
+.dsr/
+.kiro
